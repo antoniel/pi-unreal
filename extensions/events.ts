@@ -33,7 +33,7 @@ export function rowsFromEvent(event: Event): Row[] {
     }
     const reasoningTokens = response?.Usage?.ReasoningTokens ?? 0;
     if (!showedReasoning && reasoningTokens > 0) {
-      add("reasoning", `Raciocínio usado (${reasoningTokens} tokens); o provedor não enviou resumo legível.`);
+      add("reasoning", `Reasoning used (${reasoningTokens} tokens); the provider did not return a readable summary.`);
     }
     if (response?.Failure?.Message) add("error", response.Failure.Message);
   } else if (event.Kind === "tool_call_status" && event.Data?.Status?.Error) {

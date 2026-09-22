@@ -6,14 +6,21 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { rowsFromEvent, type Row, type Event } from "./events.ts";
+import { runnerConfig, type RunnerConfig, type Source } from "./provider.ts";
 
 const stateRoot = process.env.PI_UNREAL_STATE_DIR || join(homedir(), ".local", "state", "pi-unreal");
 const localRunner = join(homedir(), ".local", "bin", "unreal-agent-runner");
 const runner = process.env.PI_UNREAL_RUNNER || (existsSync(localRunner) ? localRunner : "unreal-agent-runner");
-const model = process.env.PI_UNREAL_MODEL || "gpt-6-sol";
+const defaultModel = process.env.PI_UNREAL_MODEL || "gpt-6-sol";
+const defaultProvider = process.env.PI_UNREAL_PROVIDER || "openai-codex";
+const runnerProviders = new Set(["openai-codex", "openai", "openrouter", "fireworks", "ollama"]);
 
 export default function (pi: ExtensionAPI) {
-  let enabled = false;
+  let mode: "off" | "native" | "runner" = "off";
+  let source: Source = process.env.PI_UNREAL_SOURCE === "pi" ? "pi" : "runner";
+  let runnerProvider = defaultProvider;
+  let runnerModel = defaultModel;
+  let starting = false;
   let active: ChildProcessWithoutNullStreams | undefined;
   let sessionId = "";
   let rowsFile = "";
@@ -32,6 +39,7 @@ export default function (pi: ExtensionAPI) {
     generation++;
     active?.kill("SIGINT");
     active = undefined;
+    starting = false;
     queue.length = 0;
     const project = createHash("sha256").update(ctx.cwd).digest("hex");
     const directory = join(stateRoot, project);
@@ -52,27 +60,62 @@ export default function (pi: ExtensionAPI) {
         catch { /* Ignore one damaged display row; runner history stays intact. */ }
       }
     }
-    ctx.ui.setStatus("pi-unreal", "Unreal Agent");
   }
 
-  function activate(ctx: ExtensionContext) {
-    if (enabled) return;
+  function statusLabel(ctx: ExtensionContext) {
+    return source === "pi" ? (ctx.model ? `${ctx.model.provider}/${ctx.model.id} (Pi)` : "no Pi model selected") : `${runnerProvider}/${runnerModel}`;
+  }
+
+  function stopRunner() {
+    // Invalidate callbacks before signalling the runner: a late close/data
+    // event must not append rows, restart queued work or overwrite Pi's status.
+    generation++;
+    const child = active;
+    active = undefined;
+    starting = false;
+    queue.length = 0;
+    child?.kill("SIGINT");
+  }
+
+  function activateRunner(ctx: ExtensionContext) {
+    if (mode === "runner") return;
     reset(ctx);
-    enabled = true;
-    ctx.ui.setFooter((_tui, theme) => new Text(theme.fg("accent", `Unreal Agent · ${model} · ${ctx.cwd}`), 0, 0));
+    mode = "runner";
+    // Keep Pi's built-in footer (model, context, tokens and other extensions).
+    ctx.ui.setStatus("pi-unreal", `Unreal runner · ${statusLabel(ctx)}`);
+  }
+
+  function activateNative(ctx: ExtensionContext) {
+    if (mode === "runner") stopRunner();
+    mode = "native";
+    ctx.ui.setStatus("pi-unreal", "Pi native · Unreal workflow");
   }
 
   function renderEvent(event: Event) {
     for (const row of rowsFromEvent(event)) show(row.kind, row.text);
   }
 
-  function startNext(ctx: ExtensionContext) {
-    if (active || queue.length === 0) return;
-    const prompt = queue.shift()!;
+  async function startNext(ctx: ExtensionContext) {
+    if (active || starting || queue.length === 0) return;
+    starting = true;
     const runGeneration = generation;
+    let config: RunnerConfig;
+    try {
+      config = await runnerConfig(ctx, source, runnerProvider, runnerModel);
+    } catch (error) {
+      if (runGeneration === generation) {
+        starting = false;
+        queue.length = 0;
+        show("error", error instanceof Error ? error.message : String(error));
+        ctx.ui.setStatus("pi-unreal", `Unreal runner · ${statusLabel(ctx)}`);
+      }
+      return;
+    }
+    if (runGeneration !== generation) return;
+    const prompt = queue.shift()!;
     const request = JSON.stringify({ prompt, session_id: sessionId });
     show("user", prompt);
-    ctx.ui.setStatus("pi-unreal", "Unreal Agent trabalhando…");
+    ctx.ui.setStatus("pi-unreal", `Unreal runner · ${config.label} · working…`);
 
     let child: ChildProcessWithoutNullStreams;
     try {
@@ -85,17 +128,18 @@ export default function (pi: ExtensionAPI) {
         cwd: ctx.cwd,
         env: {
           ...process.env,
-          UNREAL_HARNESS_LLM_PROVIDER: "openai-codex",
-          UNREAL_HARNESS_LLM_MODEL: model,
+          ...config.env,
         },
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
       show("error", String(error));
-      ctx.ui.setStatus("pi-unreal", "Unreal Agent");
+      ctx.ui.setStatus("pi-unreal", `Unreal runner · ${statusLabel(ctx)}`);
+      starting = false;
       return;
     }
     active = child;
+    starting = false;
     child.stdin.end();
     let pending = "";
     let stderr = "";
@@ -114,7 +158,7 @@ export default function (pi: ExtensionAPI) {
           if (event.Kind === "model_response") sawResponse = true;
           renderEvent(event);
         } catch {
-          show("error", `Evento JSONL inválido: ${line.slice(0, 300)}`);
+          show("error", `Invalid JSONL event: ${line.slice(0, 300)}`);
         }
       }
     });
@@ -126,98 +170,150 @@ export default function (pi: ExtensionAPI) {
       active = undefined;
       if (pending.trim()) {
         try { renderEvent(JSON.parse(pending)); }
-        catch { show("error", `Evento JSONL incompleto: ${pending.slice(0, 300)}`); }
+        catch { show("error", `Incomplete JSONL event: ${pending.slice(0, 300)}`); }
       }
-      if (code !== 0) show("error", stderr.trim() || `Runner terminou: ${signal ?? code}`);
-      else if (!sawResponse) show("info", "Runner terminou sem resposta do modelo.");
-      ctx.ui.setStatus("pi-unreal", "Unreal Agent");
+      if (code !== 0) show("error", stderr.trim() || `Runner exited: ${signal ?? code}`);
+      else if (!sawResponse) show("info", "Runner exited without a model response.");
+      ctx.ui.setStatus("pi-unreal", `Unreal runner · ${statusLabel(ctx)}`);
       startNext(ctx);
     });
   }
 
   pi.registerEntryRenderer<Row>("pi-unreal-row", (entry, _options, theme) => {
     const { kind, text } = entry.data;
-    const label = { user: "Você", assistant: "Unreal", reasoning: "Raciocínio", tool: "Ferramenta", error: "Erro", info: "Info" }[kind];
+    const label = { user: "You", assistant: "Unreal", reasoning: "Reasoning", tool: "Tool", error: "Error", info: "Info" }[kind];
     const color = { user: "accent", assistant: "success", reasoning: "dim", tool: "muted", error: "error", info: "dim" }[kind] as Parameters<typeof theme.fg>[0];
     return new Text(`${theme.fg(color, label)}  ${text}`, 1, 0);
   });
 
-  pi.on("session_start", () => { enabled = false; });
+  pi.on("session_start", () => { mode = "off"; });
+
+  // Only a turn-scoped instruction: the Pi still owns the conversation, model,
+  // tools, streaming, reasoning widgets and all other extension lifecycle events.
+  pi.on("before_agent_start", (event) => {
+    if (mode !== "native") return;
+    return { systemPrompt: `${event.systemPrompt}\n\nCoding workflow: inspect the project before editing, make focused changes and verify them with relevant checks. Preserve the user's instructions and the tools and context provided by Pi.` };
+  });
 
   pi.on("session_shutdown", (_event, ctx) => {
-    generation++;
-    active?.kill("SIGINT");
-    active = undefined;
-    enabled = false;
+    stopRunner();
+    mode = "off";
     ctx.ui.setStatus("pi-unreal", undefined);
-    ctx.ui.setFooter(undefined);
   });
 
   pi.registerCommand("unreal", {
-    description: "Ativar o Unreal Agent no Pi; opcionalmente enviar uma tarefa",
+    description: "Enable Pi-native workflow (Pi model, tools and UI)",
     handler: async (args, ctx) => {
-      activate(ctx);
+      activateNative(ctx);
+      const prompt = args.trim();
+      if (prompt) pi.sendUserMessage(prompt);
+      else ctx.ui.notify("Native mode active: using Pi's model, tools, reasoning and extensions.", "info");
+    },
+  });
+
+  pi.registerCommand("unreal-runner", {
+    description: "Enable external Unreal Agent runner (separate tools and session)",
+    handler: async (args, ctx) => {
+      if (mode !== "runner" && !ctx.isIdle()) {
+        ctx.ui.notify("Wait for Pi to finish or interrupt its task before enabling the runner.", "warning");
+        return;
+      }
+      activateRunner(ctx);
       const prompt = args.trim();
       if (prompt) {
         queue.push(prompt);
         startNext(ctx);
-      } else {
-        ctx.ui.notify("Unreal Agent ativo. Digite sua tarefa no editor do Pi.", "info");
+      } else ctx.ui.notify("External runner active. Use /unreal to return to Pi-native mode.", "info");
+    },
+  });
+
+  pi.registerCommand("unreal-model", {
+    description: "Use Pi's model connector or choose a runner provider/model",
+    handler: async (args, ctx) => {
+      const choice = args.trim();
+      if (choice !== "pi" && choice !== "runner" && !choice.startsWith("runner ")) {
+        ctx.ui.notify("Usage: /unreal-model pi | /unreal-model runner [provider/model]", "info");
+        return;
       }
+      if (active || starting) {
+        ctx.ui.notify("Wait for the task to finish or use /unreal-stop before switching models.", "warning");
+        return;
+      }
+      if (choice.startsWith("runner ")) {
+        const selection = choice.slice("runner ".length).trim();
+        const slash = selection.indexOf("/");
+        const selectedProvider = selection.slice(0, slash);
+        const selectedModel = selection.slice(slash + 1);
+        if (slash < 1 || !runnerProviders.has(selectedProvider) || !selectedModel || /\s/.test(selectedModel)) {
+          ctx.ui.notify("Choose a valid provider/model: openai-codex, openai, openrouter, fireworks or ollama.", "warning");
+          return;
+        }
+        runnerProvider = selectedProvider;
+        runnerModel = selectedModel;
+      }
+      source = choice === "pi" ? "pi" : "runner";
+      if (mode === "runner") ctx.ui.setStatus("pi-unreal", `Unreal runner · ${statusLabel(ctx)}`);
+      ctx.ui.notify(`External runner model: ${statusLabel(ctx)}. /unreal uses Pi-native mode.`, "info");
     },
   });
 
   pi.registerCommand("unreal-off", {
-    description: "Voltar ao agente normal do Pi",
+    description: "Return to the normal Pi agent",
     handler: async (_args, ctx) => {
-      if (active) {
-        ctx.ui.notify("Interrompa a tarefa atual com /unreal-stop antes de sair.", "warning");
-        return;
-      }
-      enabled = false;
-      queue.length = 0;
+      if (mode === "runner") stopRunner();
+      mode = "off";
       ctx.ui.setStatus("pi-unreal", undefined);
-      ctx.ui.setFooter(undefined);
-      ctx.ui.notify("Unreal Agent desativado.", "info");
+      ctx.ui.notify("Unreal mode disabled; back to normal Pi.", "info");
     },
   });
 
   pi.registerCommand("unreal-new", {
-    description: "Começar uma nova conversa no Unreal Agent",
+    description: "Start a new Unreal Agent conversation",
     handler: async (_args, ctx) => {
-      if (!enabled) activate(ctx);
-      if (active) {
-        ctx.ui.notify("Interrompa a tarefa atual com /unreal-stop antes de começar outra conversa.", "warning");
+      if (mode !== "runner") {
+        ctx.ui.notify("/unreal-new is only available in external runner mode. Use /unreal-runner first.", "warning");
+        return;
+      }
+      if (active || starting) {
+        ctx.ui.notify("Stop the current task with /unreal-stop before starting a new conversation.", "warning");
         return;
       }
       queue.length = 0;
       sessionId = randomUUID();
       writeFileSync(stateFile, JSON.stringify({ sessionId }), { mode: 0o600 });
       writeFileSync(rowsFile, "", { mode: 0o600 });
-      show("info", "Nova conversa iniciada.");
+      show("info", "New conversation started.");
     },
   });
 
   pi.registerCommand("unreal-stop", {
-    description: "Interromper a tarefa atual do Unreal Agent",
+    description: "Interrupt the current Unreal Agent task",
     handler: async (_args, ctx) => {
+      if (mode !== "runner") {
+        ctx.ui.notify("Use Pi's normal interrupt in native mode.", "info");
+        return;
+      }
       queue.length = 0;
-      if (active) active.kill("SIGINT");
-      else ctx.ui.notify("Nenhuma tarefa em execução.", "info");
+      if (starting && !active) {
+        generation++;
+        starting = false;
+        ctx.ui.setStatus("pi-unreal", `Unreal runner · ${statusLabel(ctx)}`);
+      } else if (active) active.kill("SIGINT");
+      else ctx.ui.notify("No task is running.", "info");
     },
   });
 
   pi.on("input", (event, ctx) => {
-    if (!enabled) return { action: "continue" };
+    if (mode !== "runner") return { action: "continue" };
     if (event.source !== "interactive") return { action: "continue" };
     if (event.images?.length) {
-      ctx.ui.notify("pi-unreal aceita texto; anexos ainda não são enviados ao runner.", "warning");
+      ctx.ui.notify("pi-unreal accepts text; attachments are not sent to the runner yet.", "warning");
       return { action: "handled" };
     }
     const prompt = event.text.trim();
     if (prompt) {
       queue.push(prompt);
-      if (active) ctx.ui.notify("Tarefa colocada na fila.", "info");
+      if (active || starting) ctx.ui.notify("Task queued.", "info");
       startNext(ctx);
     }
     return { action: "handled" };

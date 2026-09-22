@@ -6,15 +6,15 @@ test("renders provider reasoning summaries without exposing encrypted content", 
     Kind: "model_response",
     Data: { Response: {
       Output: [
-        { Type: "reasoning", Data: { Summary: ["Conferi as opções."], Raw: { encrypted_content: "secret" } } },
-        { Type: "message", Data: { Role: "assistant", Phase: "final_answer", Text: "Feito." } },
+        { Type: "reasoning", Data: { Summary: ["I checked the options."], Raw: { encrypted_content: "secret" } } },
+        { Type: "message", Data: { Role: "assistant", Phase: "final_answer", Text: "Done." } },
       ],
       Usage: { ReasoningTokens: 25 },
     } },
   });
   expect(rows).toEqual([
-    { kind: "reasoning", text: "Conferi as opções." },
-    { kind: "assistant", text: "Feito." },
+    { kind: "reasoning", text: "I checked the options." },
+    { kind: "assistant", text: "Done." },
   ]);
   expect(JSON.stringify(rows)).not.toContain("secret");
 });
@@ -27,5 +27,5 @@ test("reports used reasoning when only encrypted content is returned", () => {
       Usage: { ReasoningTokens: 8 },
     } },
   });
-  expect(rows).toEqual([{ kind: "reasoning", text: "Raciocínio usado (8 tokens); o provedor não enviou resumo legível." }]);
+  expect(rows).toEqual([{ kind: "reasoning", text: "Reasoning used (8 tokens); the provider did not return a readable summary." }]);
 });

@@ -1,80 +1,89 @@
 # pi-unreal
 
-Extensão do [Pi](https://pi.dev/) que usa o [Unreal Agent](https://github.com/unreallabsai/unreal-agent) como agente de código. Você continua digitando no Pi; a extensão envia a tarefa ao `unreal-agent-runner` e renderiza as respostas e chamadas de ferramenta. Ao ativá-la, o modelo e as ferramentas do Pi não executam essas tarefas.
+A [Pi](https://pi.dev/) extension with two modes:
 
-## Instalar
+- **`/unreal` (default):** a **Pi-native** coding workflow. Pi still manages the model selected with `/model`, authentication, reasoning and streaming, tools, widgets, sessions, and events from other extensions. This extension only adds workflow guidance to the turn's system prompt; it does not replace Pi's settings.
+- **`/unreal-runner` (optional):** runs the actual [Unreal Agent](https://github.com/unreallabsai/unreal-agent) in an external process with its own tools and session. Runner tool calls and reasoning are not emitted as native Pi events, so other Pi extensions that rely on those events **will not** receive them.
 
-Você precisa ter Pi, Git e Go 1.27+ instalados. Para usar a assinatura Codex, faça login na Codex CLI com sua conta ChatGPT:
+The native mode **is not the Unreal Agent runtime**: it uses Pi's agent with a coding workflow. Use `/unreal-runner` if you need the Unreal Agent runtime and accept this separation.
+
+## Installation
+
+For native mode, install [Pi](https://pi.dev/) and configure a Pi model (for example, with `/login` and `/model`). Then install this package directly from Git:
 
 ```sh
-codex login
+pi install git:github.com/antoniel/pi-unreal
+pi list
 ```
 
-Clone este repositório **no seu computador** e registre a pasta como um pacote do Pi:
+Alternatively, to work from a local checkout, install Git, clone the repository, and register its directory with Pi:
 
 ```sh
 git clone https://github.com/antoniel/pi-unreal.git
 cd pi-unreal
 pi install "$(pwd)"
+pi list
 ```
 
-Instale o executável do Unreal Agent:
+A local-path install refers to that checkout; keep it in place. Git installs are managed by Pi and can be updated with `pi update --extensions`. Neither installation method requires Go for native mode.
+
+To use the **optional external runner**, install Go 1.27+ and its executable:
 
 ```sh
+mkdir -p "$HOME/.local/bin"
 GOBIN="$HOME/.local/bin" go install github.com/unreallabsai/unreal-agent/cmd/unreal-agent-runner@latest
 ```
 
-A extensão procura `~/.local/bin/unreal-agent-runner` primeiro e depois o `PATH`. Para conferir o registro, rode `pi list`.
+The extension looks for `~/.local/bin/unreal-agent-runner` first, then searches `PATH`. You can override the location with `PI_UNREAL_RUNNER`. If you use the runner's default Codex provider, also install the Codex CLI and run `codex login` before starting a task. The runner is not required for `/unreal`.
 
-## Usar dentro do Pi
+## Usage
 
-Entre na pasta do projeto em que o agente vai trabalhar e abra o Pi normalmente:
+Open Pi in the project you want to work on:
 
 ```sh
-cd /caminho/do/projeto
+cd /path/to/project
 pi
 ```
 
-No editor do Pi, digite **`/unreal`**. A partir daí, mensagens comuns vão para o Unreal Agent. Você também pode iniciar com `/unreal Sua tarefa aqui`.
-
-| Comando | Efeito |
+| Command | Effect |
 | --- | --- |
-| `/unreal` | Ativa o Unreal Agent para a conversa atual. |
-| `/unreal-off` | Volta ao agente normal do Pi. |
-| `/unreal-stop` | Interrompe a tarefa atual e limpa a fila. |
-| `/unreal-new` | Inicia outra conversa do Unreal Agent no projeto. |
+| `/unreal` or `/unreal Your task` | Enables **Pi-native mode**, optionally sending a task to Pi. Does not start the runner. |
+| `/unreal-runner` or `/unreal-runner Your task` | Enables the external runner; subsequent interactive messages go to it. Wait for or interrupt any active Pi task before switching. |
+| `/unreal-off` | Disables native mode or stops the runner (discarding its queue) and returns to normal Pi. |
+| `/unreal-stop` | Interrupts the current **runner** task and clears its queue; in native mode, use Pi's normal interrupt. |
+| `/unreal-new` | Starts a new **runner** conversation; in native mode, use Pi's session commands. |
+| `/unreal-model pi` | **Runner only:** uses a compatible Pi model and its credential. Not needed in native mode. |
+| `/unreal-model runner [provider/model]` | **Runner only:** returns to the runner's own provider/model; optionally changes the selection without restarting Pi. |
 
-As tarefas enviadas enquanto outra está em execução ficam na fila. A conversa do Unreal Agent continua entre reinícios do Pi no mesmo projeto. `/unreal-new` troca o contexto do agente; as mensagens antigas podem continuar visíveis até você reabrir o Pi.
+In native mode, `/model`, tools, reasoning, attachments, history, and widgets continue working as usual in Pi. There is no parallel rendering or footer replacement. `/unreal-off` removes the extra instructions on future turns; it does not change a Pi response that has already started.
 
-## Como funciona
+## External runner (optional)
 
 ```text
-editor do Pi → extensão → unreal-agent-runner → modelo e ferramentas do Unreal Agent
-     ↑              ← eventos JSONL da sessão ←
-     └──────────── renderização no terminal
+Pi editor → extension → unreal-agent-runner → Unreal Agent model and tools
+    ↑             ← session JSONL events ←
+    └──────────── separate terminal rendering
 ```
 
-A extensão intercepta a mensagem digitada quando `/unreal` está ativo, envia um pedido JSON com `prompt` e `session_id` ao runner e desenha os eventos JSONL como **Você**, **Unreal**, **Raciocínio** e **Ferramenta**. Sem ativar `/unreal`, o Pi continua funcionando normalmente. A extensão não substitui nem modifica o runtime do Pi.
+The runner defaults to `openai-codex` with `gpt-6-sol`, **only in this mode**. For a Codex subscription, run `codex login`: the runner reads the Codex CLI credential from `~/.codex/auth.json` or `CODEX_HOME/auth.json`, but does not refresh tokens. Log in again if it expires. To choose another runner provider/model, use `/unreal-model runner openrouter/openai/gpt-4.1`, for example, with the corresponding runner credential (`OPENROUTER_API_KEY` in this example).
 
-O provedor padrão é `openai-codex`, com modelo `gpt-6-sol`. Ele usa a credencial existente da Codex CLI em `~/.codex/auth.json` ou `CODEX_HOME/auth.json`; uma chave `OPENAI_API_KEY` não é necessária nesse fluxo. O runner não faz login nem renova tokens. Se a credencial expirar, execute `codex login` novamente.
+You can also use `/unreal-model pi` **in runner mode** to resolve Pi's current model and credential for each new task. This only works with `api: openai-responses` models from runner-supported providers (`openai`, `openrouter`, or `fireworks`), an API key, and no extra headers. Other protocols (Anthropic, Gemini, OpenAI Completions, Pi's ChatGPT login, etc.) are incompatible: the extension warns you **before** launching the runner and does not send the token to another provider. To use those connectors, tools, and widgets without adaptation, use Pi-native `/unreal`. Even with `/unreal-model pi`, the runner does not use Pi's tools, reasoning events, or extensions.
 
-O estado fica em `~/.local/state/pi-unreal/`, fora do projeto: sessões e logs do runner, além do histórico visual por projeto. O histórico visual não substitui a sessão do agente. A extensão não copia credenciais para esse diretório.
+Runner conversation state persists across Pi restarts in the same project. It is stored outside the project in `~/.local/state/pi-unreal/`: runner sessions and logs, plus the visual history. `/unreal-new` changes the runner's conversation context; older messages may remain visible until you reopen Pi. The extension does not store credentials in its state; in the runner's Pi-model mode, it only passes the key through the child process environment.
 
-### Configuração opcional
-
-Defina variáveis de ambiente antes de abrir o Pi:
-
-| Variável | Uso |
+| Environment variable | Purpose (external runner) |
 | --- | --- |
-| `PI_UNREAL_MODEL` | Escolhe outro modelo; o padrão é `gpt-6-sol`. |
-| `PI_UNREAL_RUNNER` | Caminho para outro executável `unreal-agent-runner`. |
-| `PI_UNREAL_STATE_DIR` | Diretório alternativo para sessões, logs e histórico visual. |
+| `PI_UNREAL_MODEL` | Default runner model; `gpt-6-sol`. |
+| `PI_UNREAL_PROVIDER` | Default runner provider (`openai-codex`, `openai`, `openrouter`, `fireworks`, `ollama`); `openai-codex`. |
+| `PI_UNREAL_SOURCE` | Set to `pi` to start **the runner** with a compatible Pi model; defaults to `runner`. Does not affect `/unreal`. |
+| `PI_UNREAL_RUNNER` | Path to a different `unreal-agent-runner` executable. |
+| `PI_UNREAL_STATE_DIR` | Alternative directory for runner sessions, logs, and visual history. |
 
-**Limites atuais:** o runner emite eventos após cada resposta do modelo; não há texto token a token. Anexos de imagem do editor do Pi ainda não são enviados ao runner. Quando o provedor fornece um resumo de reasoning, a extensão o exibe. Quando só devolve conteúdo criptografado, a extensão mostra apenas a contagem de tokens de reasoning.
+**Runner limitations:** events arrive after each response, not token by token. Images attached in Pi's editor are not sent to the runner. When the provider returns a readable reasoning summary, it appears on a separate line; when it returns only encrypted content, the extension shows only the reasoning token count. Tasks submitted while another runner task is active are queued.
 
-## Desenvolvimento
+## Development
 
-O pacote usa a [API de extensões do Pi](https://pi.dev/docs/latest/extensions) e os [eventos do runner](https://github.com/unreallabsai/unreal-agent/blob/main/cmd/unreal-agent-runner/README.md). O Pi carrega o TypeScript diretamente, sem uma etapa de compilação. Para rodar os testes, instale Bun e execute:
+The package uses the [Pi extension API](https://pi.dev/docs/latest/extensions) and [runner events](https://github.com/unreallabsai/unreal-agent/blob/main/cmd/unreal-agent-runner/README.md). Pi loads TypeScript directly. To run the tests, install Bun and execute:
 
 ```sh
 bun test tests

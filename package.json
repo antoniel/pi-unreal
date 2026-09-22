@@ -1,7 +1,7 @@
 {
   "name": "pi-unreal",
   "version": "0.1.0",
-  "description": "Pi terminal interface for the Unreal Agent runner",
+  "description": "Pi-native coding workflow with an optional Unreal Agent runner",
   "type": "module",
   "keywords": ["pi-package", "unreal-agent", "coding-agent"],
   "pi": {
