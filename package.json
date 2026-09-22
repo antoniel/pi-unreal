@@ -1,0 +1,17 @@
+{
+  "name": "pi-unreal",
+  "version": "0.1.0",
+  "description": "Pi terminal interface for the Unreal Agent runner",
+  "type": "module",
+  "keywords": ["pi-package", "unreal-agent", "coding-agent"],
+  "pi": {
+    "extensions": ["./extensions/pi-unreal.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": {
+    "test": "bun test tests"
+  }
+}
