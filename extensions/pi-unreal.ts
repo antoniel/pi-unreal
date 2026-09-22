@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { rowsFromEvent, type Row, type Event } from "./events.ts";
 import { runnerConfig, type RunnerConfig, type Source } from "./provider.ts";
@@ -14,6 +14,28 @@ const runner = process.env.PI_UNREAL_RUNNER || (existsSync(localRunner) ? localR
 const defaultModel = process.env.PI_UNREAL_MODEL || "gpt-6-sol";
 const defaultProvider = process.env.PI_UNREAL_PROVIDER || "openai-codex";
 const runnerProviders = new Set(["openai-codex", "openai", "openrouter", "fireworks", "ollama"]);
+
+// The runner REPLACES its default harness prompt when a request sets
+// system_prompt (cmd/internal/agentrunner/run.go), so mirror that default and
+// append our workflow instructions. Keep in sync with defaultSystemPrompt upstream.
+const harnessSystemPrompt = `You are an AI agent running inside an isolated sandbox container.
+
+## Guidelines
+- Save output files to the workspace root.
+- For large datasets, inspect a sample first before processing everything.`;
+const workflowCore = "Coding workflow: inspect the project before editing, make focused changes and verify them with relevant checks.";
+const nativeWorkflowSuffix = " Preserve the user's instructions and the tools and context provided by Pi.";
+const runnerWorkflowSuffix = " Preserve the user's instructions and the harness's tools and session.";
+const runnerSystemPrompt = `${harnessSystemPrompt}\n\n${workflowCore}${runnerWorkflowSuffix}`;
+
+// The runner validates thinking_level to low|medium|high|xhigh|max and treats
+// an omitted level as its own default, so clamp Pi's off/minimal to low and
+// drop the field entirely when Pi exposes no level.
+const runnerThinkingLevels = new Set(["low", "medium", "high", "xhigh", "max"]);
+function runnerThinkingLevel(level?: string) {
+  if (!level) return undefined;
+  return runnerThinkingLevels.has(level) ? level : "low";
+}
 
 export default function (pi: ExtensionAPI) {
   let mode: "off" | "native" | "runner" = "off";
@@ -113,7 +135,13 @@ export default function (pi: ExtensionAPI) {
     }
     if (runGeneration !== generation) return;
     const prompt = queue.shift()!;
-    const request = JSON.stringify({ prompt, session_id: sessionId });
+    const thinkingLevel = runnerThinkingLevel(ctx.thinkingLevel);
+    const request = JSON.stringify({
+      prompt,
+      session_id: sessionId,
+      system_prompt: runnerSystemPrompt,
+      ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
+    });
     show("user", prompt);
     ctx.ui.setStatus("pi-unreal", `Unreal runner · ${config.label} · working…`);
 
@@ -188,11 +216,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", () => { mode = "off"; });
 
-  // Only a turn-scoped instruction: the Pi still owns the conversation, model,
-  // tools, streaming, reasoning widgets and all other extension lifecycle events.
+  // Turn-scoped instruction for /unreal-native only: Pi still owns the
+  // conversation, model, tools, streaming, reasoning widgets and all other
+  // extension lifecycle events.
   pi.on("before_agent_start", (event) => {
     if (mode !== "native") return;
-    return { systemPrompt: `${event.systemPrompt}\n\nCoding workflow: inspect the project before editing, make focused changes and verify them with relevant checks. Preserve the user's instructions and the tools and context provided by Pi.` };
+    return { systemPrompt: `${event.systemPrompt}\n\n${workflowCore}${nativeWorkflowSuffix}` };
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
@@ -201,29 +230,36 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("pi-unreal", undefined);
   });
 
+  const enableHybrid = async (args: string, ctx: ExtensionCommandContext) => {
+    if (mode !== "runner" && !ctx.isIdle()) {
+      ctx.ui.notify("Wait for Pi to finish or interrupt its task before enabling the Unreal Agent.", "warning");
+      return;
+    }
+    activateRunner(ctx);
+    const prompt = args.trim();
+    if (prompt) {
+      queue.push(prompt);
+      startNext(ctx);
+    } else ctx.ui.notify("Unreal Agent active: the real runner runs underneath with Pi's UI. /unreal-native uses Pi's own agent.", "info");
+  };
+
   pi.registerCommand("unreal", {
-    description: "Enable Pi-native workflow (Pi model, tools and UI)",
+    description: "Hybrid: run the real Unreal Agent underneath with Pi's UI",
+    handler: enableHybrid,
+  });
+
+  pi.registerCommand("unreal-runner", {
+    description: "Alias of /unreal (real Unreal Agent underneath)",
+    handler: enableHybrid,
+  });
+
+  pi.registerCommand("unreal-native", {
+    description: "Pi-native workflow: Pi's model, tools and UI (no runner)",
     handler: async (args, ctx) => {
       activateNative(ctx);
       const prompt = args.trim();
       if (prompt) pi.sendUserMessage(prompt);
-      else ctx.ui.notify("Native mode active: using Pi's model, tools, reasoning and extensions.", "info");
-    },
-  });
-
-  pi.registerCommand("unreal-runner", {
-    description: "Enable external Unreal Agent runner (separate tools and session)",
-    handler: async (args, ctx) => {
-      if (mode !== "runner" && !ctx.isIdle()) {
-        ctx.ui.notify("Wait for Pi to finish or interrupt its task before enabling the runner.", "warning");
-        return;
-      }
-      activateRunner(ctx);
-      const prompt = args.trim();
-      if (prompt) {
-        queue.push(prompt);
-        startNext(ctx);
-      } else ctx.ui.notify("External runner active. Use /unreal to return to Pi-native mode.", "info");
+      else ctx.ui.notify("Pi-native mode active: using Pi's model, tools, reasoning and extensions.", "info");
     },
   });
 
@@ -253,7 +289,7 @@ export default function (pi: ExtensionAPI) {
       }
       source = choice === "pi" ? "pi" : "runner";
       if (mode === "runner") ctx.ui.setStatus("pi-unreal", `Unreal runner · ${statusLabel(ctx)}`);
-      ctx.ui.notify(`External runner model: ${statusLabel(ctx)}. /unreal uses Pi-native mode.`, "info");
+      ctx.ui.notify(`Runner model: ${statusLabel(ctx)}. /unreal-native uses Pi's own model.`, "info");
     },
   });
 
@@ -271,7 +307,7 @@ export default function (pi: ExtensionAPI) {
     description: "Start a new Unreal Agent conversation",
     handler: async (_args, ctx) => {
       if (mode !== "runner") {
-        ctx.ui.notify("/unreal-new is only available in external runner mode. Use /unreal-runner first.", "warning");
+        ctx.ui.notify("/unreal-new is only available while the Unreal runner is active. Use /unreal first.", "warning");
         return;
       }
       if (active || starting) {
@@ -290,7 +326,7 @@ export default function (pi: ExtensionAPI) {
     description: "Interrupt the current Unreal Agent task",
     handler: async (_args, ctx) => {
       if (mode !== "runner") {
-        ctx.ui.notify("Use Pi's normal interrupt in native mode.", "info");
+        ctx.ui.notify("The Unreal runner is not active; use Pi's normal interrupt.", "info");
         return;
       }
       queue.length = 0;

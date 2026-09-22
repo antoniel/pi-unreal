@@ -1,7 +1,7 @@
 {
   "name": "pi-unreal",
   "version": "0.1.0",
-  "description": "Pi-native coding workflow with an optional Unreal Agent runner",
+  "description": "Runs the real Unreal Agent underneath Pi's UI, with a Pi-native fallback mode",
   "type": "module",
   "keywords": ["pi-package", "unreal-agent", "coding-agent"],
   "pi": {
